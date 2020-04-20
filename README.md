@@ -5,7 +5,7 @@ Projects involving data pre-processing, ML methods and visualisation
 This segment of code was completed for the Airbnb challenge at the AI Hack 2020 event held in Imperial College London.
 Data on Airbnb listings in NYC was pre-processed to be used for further analysis into key predictors of availability.
 
-## 2) Predicting wine quality using k-NN
+## 2) Predicting wine quality with k-NN
 This is a Machine Learning coursework done using Python, as part of the MSc Business Analytics programme.
 Various features are used to predict the quality of wine, using k-NN and by determining the optimal value of k.
 
