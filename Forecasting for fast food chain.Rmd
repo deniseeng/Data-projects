@@ -1,0 +1,535 @@
+---
+title: "Logistics and Supply Chain"
+author: "Denise Eng (CID: 01005792)"
+date: "10 March 2020"
+output: 
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "C:/Users/Denise/Documents/07 Imperial College Business School/03 Modules/13 Logistics & Supply Chain Analytics/Individual Project/Data")
+getwd()
+
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(forecast)
+library(tseries)
+library(lubridate)
+```
+
+### 1. Introduction
+In this project, we examine datasets from one of the largest fast-food restaurant chains in the US and forecast the daily demand for a single ingredient, lettuce, for a period of two weeks, from 06/16/2015 to 06/29/2015. The forecast is conducted for four separate restaurants numbered 46673, 4904, 12631 and 20974. The objective of this forecast is to facilitate the inventory replenishment decisions made by restaurant managers. We first determine the optimal parameters for two different models, ARIMA and Holt-Winters', before comparing the performance of the respective optimal models to select the best model for forecasting.
+
+### 2. Data Cleaning and Preparation
+To make forecasts, we first need to clean and prepare data from 11 separate files containing transaction information, ingredient lists for individual menu items and metadata on restaurants. The objective is to consolidate relevant information from the files into a single dataframe which can be used for forecasting. More specifically, we would like to obtain a dataframe of the daily quantity of lettuce used in purchased items by store. Although all datasets are loaded below, not all of them are used eventually.
+
+#### 2.1 Load datasets
+```{r}
+# Load csv datasets
+ingredients <- read.csv("ingredients.csv", header=TRUE)
+menu_items <- read.csv("menu_items.csv", header=TRUE)
+menuitem <- read.csv("menuitem.csv", header=TRUE)
+portion_uom_types <- read.csv("portion_uom_types.csv", header=TRUE)
+pos_ordersale <- read.csv("pos_ordersale.csv", header=TRUE)
+recipes_ingredient_assignments <- read.csv("recipe_ingredient_assignments.csv", header=TRUE)
+recipe_sub_recipe_assignments <- read.csv("recipe_sub_recipe_assignments.csv", header=TRUE)
+recipes <- read.csv("recipes.csv", header=TRUE)
+store_restaurant <- read.csv("store_restaurant.csv", header=TRUE)
+sub_recipes_ingr_assignments <- read.csv("sub_recipe_ingr_assignments.csv", header=TRUE)
+sub_recipes <- read.csv("sub_recipes.csv", header=TRUE)
+```
+
+#### 2.2 Merge datasets
+**Step 1**\
+We carry out an inner join of the datasets "ingredients" and "portion_uom_types" to get the portion type of each ingredient. We then drop several columns which are unnecessary for the forecasting and filter the dataset to leave only rows with ingredients containing the word "Lettuce" in the dataset. As shown below, we find that there are two relevant unique ingredients, 27 ("Lettuce") and 291 ("Lettuce - Metric"), with different portion types.
+```{r}
+# Inner join ingredients and portion_uom_types to get portion type of each ingredient
+ingredient_w_portion <- merge(ingredients, portion_uom_types, by="PortionUOMTypeId")
+
+# Drop unnecessary columns
+drops <- c("IngredientShortDescription","PortionUOMTypeId","IngredientName")
+
+# Filter ingredient_w_portion by the ingredient names containing "Lettuce"
+ingredient_w_portion <- ingredient_w_portion %>% 
+  filter(str_detect(IngredientName, "Lettuce")) %>% 
+  select(-drops)
+head(ingredient_w_portion)
+```
+\
+**Step 2**\
+We carry out an inner join of "ingredient_w_portion" (from Step 1) and "sub_recipes_ingr_assignments" to obtain a dataset listing the sub-recipes containing lettuce ingredients, their portion types and quantities needed for each sub-recipe. We can see below that this leaves us with 10 unique sub-recipes containing lettuce ingredients.
+```{r}
+# Inner join ingredient_w_portion and sub_recipes_ingr_assignments
+# Unique key is SubRecipeId
+sub_recipes_ingr_portion <- merge(ingredient_w_portion, sub_recipes_ingr_assignments, by="IngredientId")
+sub_recipes_ingr_portion
+```
+\
+**Step 3**\
+We carry out an inner join of "sub_recipes_ingr_portion" (from Step 2) and "recipe_sub_recipe_assignments". This is to obtain a dataset listing recipes, the sub-recipes and quantities of each subrecipe in a recipe, as well as quantities of the lettuce in each sub-recipe. Here, we can multiply the quantity of lettuce ingredient needed for each sub-recipe by the factor to determine the total quantity of lettuce required for the respective quantities of sub-recipe present in each recipe. Finally, the total quantity of lettuce required for each recipe is calculated by grouping rows in the dataset by the recipe ID. Unnecessary columns are also dropped in the process. There are 3975 observations in this dataset.
+```{r}
+# Inner join recipe_sub_recipe_assignments with sub_recipes_ingr_portion
+sub_recipe_ingr <- merge(sub_recipes_ingr_portion, recipe_sub_recipe_assignments, by="SubRecipeId")
+
+# Unnecessary columns to be dropped
+drops <- c("Factor","Quantity")
+
+# Calculate quantity of lettuce needed for each subrecipe (Factor*Quantity) and then recipe
+sub_recipe_ingr <- sub_recipe_ingr %>% 
+  mutate(QtyBySubRec = Quantity*Factor) %>% 
+  select(-drops) %>% 
+  group_by(RecipeId, IngredientId, PortionTypeDescription) %>% 
+  summarise(Quantity=sum(QtyBySubRec))
+
+head(sub_recipe_ingr)
+nrow(sub_recipe_ingr)
+```
+\
+**Step 4**\
+Similar to Step 2, we conduct an inner join of "ingredient_w_portion" and "recipes_ingredient_assignments" to obtain a dataset listing the recipes containing lettuce ingredients, their portion types and quantities needed for each recipe. There are 56 recipes containing lettuce ingredients.
+```{r}
+recipe_ingr <- merge(ingredient_w_portion, recipes_ingredient_assignments, by="IngredientId")
+head(recipe_ingr)
+nrow(recipe_ingr)
+```
+\
+**Step 5**\
+As each recipe may contain the ingredients directly as well as sub-recipes which may contain the same ingredients, we bind the two datasets obtained from Steps 3 and 4 to obtain a list of recipes containing lettuce and their respective quantities. The column "PortionTypeDescription" is dropped off in this step for a cleaner dataframe. Nevertheless, should this information be required later on, we can easily recall from earlier steps that Ingredient 27 is in ounces while Ingredient 291 is in grams.\
+As this is a combined list and a particular recipe ID may appear more than once in the list, we group the data by recipe ID to find the total quantity of each lettuce ingredient contained in each unique recipe. There are 4015 observations in this list.
+```{r}
+# Combine recipe_ingr and sub_recipe_ingr
+rec_lettuce <- bind_rows(recipe_ingr, sub_recipe_ingr)
+
+# Collapse rows to group by RecipeId to find total quantity of lettuce ingredient per unique recipe
+rec_lettuce <- rec_lettuce %>% 
+  group_by(RecipeId, IngredientId) %>% 
+  summarise(TotalQuantity = sum(Quantity))
+head(rec_lettuce)
+nrow(rec_lettuce)
+```
+\
+**Step 6**\
+We carry out an inner join of "rec_lettuce" and "menu_items", followed by another inner join of the resulting dataframe with "menuitem".
+```{r}
+# Inner join of "rec_lettuce" and "menu_items"
+menu_lettuce <- merge(rec_lettuce, menu_items, by="RecipeId")
+
+# Inner join of "menu_lettuce" and "menuitem"
+menu_lettuce <- merge(menu_lettuce, menuitem, by.x=c("MenuItemId","PLU"), by.y=c("Id","PLU"))
+
+# To avoid confusion with "TotalQuantity", we rename the "Quantity" column in "menuitem" to "MenuQuantity"
+menu_lettuce <- rename(menu_lettuce, MenuQuantity=Quantity)
+head(menu_lettuce)
+nrow(menu_lettuce)
+```
+\
+**Step 7**\
+We clean up this final dataset by selecting only the columns relevant to the forecasting. Before that, we can do a quick check on the unique values of "IngredientId", below, and see that only Ingredient 27 remains, meaning that Ingredient 291 was not used at all in any menu purchased.
+```{r}
+unique(menu_lettuce$IngredientId)
+```
+In this case, we can drop "IngredientId" along with other columns and keep only a select few which are necessary for forecasting. We also create a new column to indicate the total quantity of lettuce required in each unique menu before grouping the data by "StoreNumber" and "date". There are 395 observations remaining in this dataset.
+```{r}
+# Keep only necessary columns
+keep <- c("RecipeId","IngredientId","TotalQuantity","StoreNumber","MenuQuantity","date")
+
+menu_lettuce <- menu_lettuce %>% 
+  select(keep) %>%
+  # Create new column "LettuceQuantity" for total quantity of lettuce in each unique menu
+  mutate(LettuceQuantity = TotalQuantity*MenuQuantity) %>% 
+  group_by(date, StoreNumber) %>% 
+  summarise(LettuceQuantity=sum(LettuceQuantity)) %>% 
+  filter(StoreNumber %in% c(46673,4904,12631,20974))
+
+# Convert date column into proper date format
+menu_lettuce$date <- ymd(menu_lettuce$date)
+head(menu_lettuce)
+nrow(menu_lettuce)
+```
+
+#### 2.3 Split data by store
+We are interested in forecasting the quantity of lettuce for stores with the following numbers: 46673, 4904, 12631 and 20974. The first two stores are in California while the next two are in New York. We can split the data by stores of interest as shown below.
+```{r}
+s_46673 <- menu_lettuce %>% filter(StoreNumber==46673) %>% select(c("date","LettuceQuantity"))
+s_4904 <- menu_lettuce %>% filter(StoreNumber==4904) %>% select(c("date","LettuceQuantity"))
+s_12631 <- menu_lettuce %>% filter(StoreNumber==12631) %>% select(c("date","LettuceQuantity"))
+s_20974 <- menu_lettuce %>% filter(StoreNumber==20974) %>% select(c("date","LettuceQuantity"))
+```
+To check if we have prepared the data correctly, we filter the lettuce quantity for store number 46673 from 05/03/2015 to 11/03/2015 and match these against the values provided. As can be seen below, the quantities are correct.
+```{r}
+s_46673 %>% 
+  filter(date <= as.Date("2015-03-11"))
+```
+Upon visual inspection of the datasets, we can see that store 20974 has missing data points on certain dates before 2015-03-20 and we take the following steps to remove the first few datapoints in order to obtain a continuous series to plot a time series.
+```{r}
+head(s_20974,10)
+```
+
+```{r}
+s_20974 <- subset(s_20974, date >= "2015-03-20")
+head(s_20974)
+```
+#### 2.4 Split train and test data
+Ahead of the forecasting, we can divide the data for each of the stores into two sets - the training set and the test set. In this case, we use the first 80% of the data for the training set and the remaining 20% of more recent data points for the test set.
+```{r}
+set_size <- 0.8
+# Train & test sets for store 46673
+train_46673 <- head(s_46673, round(nrow(s_46673)*set_size))
+test_46673 <- tail(s_46673, nrow(s_46673)-nrow(train_46673))
+
+# Train & test sets for store 46673
+train_4904 <- head(s_4904, round(nrow(s_4904)*set_size))
+test_4904 <- tail(s_4904, nrow(s_4904)-nrow(train_4904))
+
+# Train & test sets for store 46673
+train_12631 <- head(s_12631, round(nrow(s_12631)*set_size))
+test_12631 <- tail(s_12631, nrow(s_12631)-nrow(train_12631))
+
+# Train & test sets for store 46673
+train_20974 <- head(s_20974, round(nrow(s_20974)*set_size))
+test_20974 <- tail(s_20974, nrow(s_20974)-nrow(train_20974))
+```
+
+### 3. Forecasting using ARIMA model for store 46673
+In this section, we carry out the steps to forecast the lettuce quantity for store 46673 using the ARIMA model with detailed explanations. As the forecasts of lettuce quantities for stores 4904, 12631 and 20974 are carried out using the same steps, we include in Section 7 the key steps taken for these stores with only brief explanations.\
+
+#### 3.1 Stationarity of time series
+We first plot the time series for store 46673 to determine if the trend is stationary by visual inspection. Since the datapoints are daily and do not make up a full year, we plot the time series with a start date comprising of the week of the year (major counter) and day of the week (minor counter), with a frequency of 7. From the plot, there appears to be seasonality in the time series for s_46673 but no strong evidence of trends.
+```{r}
+s_46673_ts <- ts(s_46673[,2], start=c(as.numeric(strftime(min(s_46673$date),format="%V")),
+                                      as.numeric(strftime(min(s_46673$date), format="%u"))), frequency=7)
+ggtsdisplay(s_46673_ts)
+```
+\
+To formally test the stationarity of time series for store 46673, we run ADF, PP and KPSS tests. All three tests concur and conclude that the time series is stationary. More specifically, both the ADP and PP tests have a p-value smaller than 0.01 and therefore the null hypothesis that the time series is non-stationary is rejected. Conversely, the p-value for the KPSS Test is greater that 0.1 so we do not reject the null hypothesis and conclude that the time series is stationary. 
+```{r}
+adf.test(s_46673_ts) 
+pp.test(s_46673_ts)
+kpss.test(s_46673_ts)
+```
+Further, to check the number of first-order differences and seasonal differences which we need to take for the time series, we can use $ndiffs()$ and $nsdiffs()$. In line with the observations made during the visual inspection, store 46673 has a time series which has seasonality but not trends, and we should therefore have one seasonal lag for the model.\
+```{r}
+# Trend and seasonality
+print(paste(ndiffs(s_46673_ts), nsdiffs(s_46673_ts)))
+```
+#### 3.2 Selection of optimal model  
+
+We can then use the function $auto.arima()$ on the training data to run a step-wise search which determines the best ARIMA model based on the lowest BIC. From the results below, we choose the model ARIMA(0,0,0)(0,1,1)[7] for forecasting and further evaluation. This optimal model gives the values of D = 1 and Q = 1 in the seasonal part of the model, suggesting that there is a moving average model of order 1. This is consistent with our findings earlier that the time series for store 46673 has seasonality and the number of seasonal lags should therefore be 1.
+```{r}
+# Obtain time series of train set
+train_46673_ts <- ts(train_46673[,2], start=c(as.numeric(strftime(min(train_46673$date), format="%V")),
+                                              as.numeric(strftime(min(train_46673$date), format="%u"))), frequency=7)
+
+# Obtain model with lowest bic
+auto.arima(train_46673_ts, trace = TRUE, ic = 'bic')
+```
+We then create the optimal model using the $Arima()$ function.\
+```{r}
+s_46673.m <- Arima(train_46673_ts, order=c(0,0,0), seasonal=list(order = c(0,1,1), period = 7))
+```
+#### 3.3 Residual analysis  
+
+To check if the suggested optimal model fits the data, we can also examine the residual plot of the optimal ARIMA model, as shown below. As expected, the residuals appear to have a zero mean with constant variance and are distributed symmetrically around the mean of zero. We can also see that there are very few lags in the ACF which are statistically significant. 
+```{r}
+checkresiduals(s_46673.m)
+```
+
+### 4. Forecasting using Holt-Winters' model for store 46673\
+#### 4.1 Stationarity of time series  
+
+Prior to determining the optimal Holt-Winters' model, we conduct a visual inspection of the time series for store 46673 again, this time using the $stl()$ function. From the plot and length of the grey bars on the right hand side of the plot, we can see that there is additive seasonality but no clear trend. \
+```{r}
+s_46673_ts[,1] %>% stl(s.window = "period") %>% autoplot
+```
+\
+#### 4.2 Model estimation  \
+We use the $ets()$ function to carry out the Holt-Winters exponential smoothing on the training data. We use the "ZZZ" to automatically select the model and "bic" as the selection critieria such that the function would suggest the optimal parameters for the Holt-Winters' model. As shown below, the specified model for store 46673 is ETS(A,N,A). This suggests that the time series of store 46673 has an additive error and seasonality but no trend, which is in line with our observations from the time series plot.\
+```{r}
+s_46673.ets <- ets(train_46673_ts, model = "ZZZ", ic="bic")
+s_46673.ets
+```
+### 5. Comparison of ARIMA and Holt-Winters' models for store 46673\
+#### 5.1 In-sample one-step ahead forecast accuracy  
+To evaluate the in-sample performance of the model, we can examine various measures of fitting errors using the $accuracy()$ function. Below, we can see that for store 46673, the Holt-Winters' model performs better in-sample as it has a lower RMSE.\
+```{r}
+accuracy(s_46673.m) # ARIMA
+accuracy(s_46673.ets) # Holt-Winters' ANA
+```
+#### 5.2 Out-of-sample one-step ahead forecast accuracy  
+
+We also carry out a one-step ahead forecast to generate a forecast of quantity of lettuce and compare it against the real data in the test set. To do this, we apply the fitted model on the test data and use the $accuracy()$ function to summarise the measures of the one-step ahead forecasting errors. Similar to the in-sample forecast accuracy, the Holt-Winters' model performs better as it has a lower RMSE than the ARIMA model does.\
+```{r}
+# Obtain time series of test dataset
+test_46673_ts <- ts(test_46673[,2], start=c(as.numeric(strftime(min(test_46673$date), format="%V")),
+                                            as.numeric(strftime(min(test_46673$date), format="%u"))), frequency=7)
+
+# Accuracy for ARIMA
+s_46673.f2 <- Arima(test_46673_ts, model = s_46673.m)
+accuracy(s_46673.f2)
+
+# Accuracy for Holt-Winters' ANA
+s_46673.ets.f2 <- ets(test_46673_ts, model="ANA")
+accuracy(s_46673.ets.f2)
+```
+#### 5.3 Out-of-sample multi-step ahead forecast accuracy  
+
+In addition, we can carry out a comparison of out-of-sample multi-step ahead forecast accuracy for both ARIMA and Holt-Winters' models. The accuracy measures for store 46673 are shown below. For each of the two models, the test set accuracy is lower than the training set accuracies. In addition, the RSME for the test sets for Holt-Winters' model is lower than that of the ARIMA model. In line with the in-sample and out-of-sample one-step ahead forecast accuracy results, the Holt-Winters' model performs better than the ARIMA model.
+```{r}
+accuracy(forecast(s_46673.m, h=nrow(test_46673)), test_46673_ts) # ARIMA
+accuracy(forecast(s_46673.ets, h=nrow(test_46673)), test_46673_ts) # Holt-Winters' ANA
+```
+As a check, we created another Holt-Winters' model with different parameters of "MNM" to compare its performance against that of the "ANA" model. Interestingly, we find that while the in-sample performance of "MNM" is worse than that of "ANA", the out-of-sample one-step ahead accuracy and out-of-sample multi-step ahead accuracy for "MNM" is better. This may be possible due to the extremely small size of the dataset, resulting in significant sampling variation. In addition, we can see that the model "MNM" does not appear to be consistent with the observations made from the visual inspection earlier as well. Hence, in this case, we choose to still use the optimal Holt-Winters' model  with parameters "ANA", as suggested by the use of the $ets()$ function with "ZZZ".\
+```{r}
+s_46673.ets.mnm <- ets(train_46673_ts, model = "MNM") # Holt-Winters' MNM
+accuracy(s_46673.ets.mnm) # In-sample accuracy
+
+s_46673.ets.mnm2 <- ets(test_46673_ts, model="MNM")
+accuracy(s_46673.ets.mnm2) # Out-of-sample one-step ahead accuracy
+
+accuracy(forecast(s_46673.ets.mnm, h=nrow(test_46673)), test_46673_ts) # Out-of-sample multi-step ahead accuracy
+```
+### 6. Selection of best forecasting model for store 46673
+
+As lettuce is an agriculture output and is likely to have high supply uncertainty, we consider the supply chain of the restaurants to be rather low in responsiveness and the restaurants may not be able to source lettuce quickly. As such, we prefer a model with lowest multi-period ahead forecasting errors and focus on the out-of-sample multi-step ahead forecast accuracy measures. We therefore compare the optimal ARIMA and Holt-Winters' models in this aspect.\
+
+We select the Holt-Winters' model of ETS(A,N,A) for store 46673 and apply it to the entire dataset to forecast the quantities of lettuce for the next 14 days. The forecasted values are saved in a dataframe to be consolidated with the forecasted values of the other stores.\
+```{r}
+# Forecast lettuce quantity for 14 days
+s_46673.ets.ana <- ets(s_46673_ts, model = "ANA")
+s_46673.results <- forecast(s_46673.ets.ana, h=14)
+
+# Create dataframe of results
+Store <- seq(as.Date('2015-06-16'), as.Date('2015-06-29'), by='days') # Date column is named "Store" to match sample submission file
+results <- as.data.frame(Store, col.names='Store') 
+results$"California 1 (ID:46673)" <- as.data.frame(s_46673.results)[,1]
+results
+```
+We also plot the forecasted quantities of lettuce using the model ETS(A,N,A) below and we can see that the forecasted quantities are generally similar to the time series values, with the exceptions of a few of the peaks.  \
+```{r}
+plot(s_46673.results)
+lines(fitted(s_46673.results), col = "blue", lty = 2)
+```
+\
+Hence, the selected model appears to be appropriate for forecasting the lettuce quantities for store 46673.\
+
+### 7. Comparison of models and forecast for stores 4904, 12631 and 20974\
+#### 7.1 Store 4904  
+\
+**ARIMA model**\
+In the time series for store 4904, there appears to be seasonality and no trend. 
+```{r}
+s_4904_ts <- ts(s_4904[,2], start=c(as.numeric(strftime(min(s_4904$date), format="%V")),
+                                    as.numeric(strftime(min(s_4904$date), format="%u"))), frequency=7)
+ggtsdisplay(s_4904_ts)
+```
+\
+All three stationarity tests for store 4904 concur and conclude that the time series is stationary. For the KPSS test, the p-value is greater than 0.01 and we therefore cannot reject the null hypothesis at 1% significance level. As such, with the KPSS test, we can still conclude that the time series is stationary.
+```{r}
+adf.test(s_4904_ts) 
+pp.test(s_4904_ts)
+kpss.test(s_4904_ts)
+```
+Using $ndiffs()$ and $nsdiffs()$, we can see that store 4904 has seasonality but not trend. This is consistent with our observations from the plot above.
+```{r}
+# Trend and seasonality
+print(paste(ndiffs(s_4904_ts), nsdiffs(s_4904_ts)))
+```
+With the $auto.arima()$ function, we identify ARIMA(0,1,1)(0,1,1)[7] as the best model for store 4904 as it has the lowest BIC. In this model, Q has the value of 1, which indicates the number of seasonal lags. In addition, it has a value of q = 1 which suggests that there is a trend and differs from the results observed above.
+```{r}
+train_4904_ts <- ts(train_4904[,2], start=c(as.numeric(strftime(min(train_4904$date), format="%V")),
+                                            as.numeric(strftime(min(train_4904$date), format="%u"))), frequency=7)
+auto.arima(train_4904_ts, trace = TRUE, ic = 'bic')
+```
+We fit the optimal ARIMA model using the train data and also check the residuals. Similar to store 46673, the residuals appear to have a zero mean with constant variance and there are no significant lags in ACF. The residuals are also distributed symmetrically around the mean of zero.
+```{r}
+s_4904.m <- Arima(train_4904_ts, order=c(0,1,1), seasonal=list(order = c(0,1,1), period = 7))
+checkresiduals(s_4904.m)
+```
+\
+**Holt-Winters' model**\
+From the plot below, we can see that there is additive seasonality and error. Conversely, there is no trend, and this is also indicated by the long grey bar on the right of the trend plot, which suggests that it is of least importance.
+```{r}
+s_4904_ts[,1] %>% stl(s.window = "period") %>% autoplot
+```
+\
+Using the $ets()$ function, we obtain the optimal Holt-Winters' model of ETS(A,N,A) which suggests that the time series of store 4904 has additive error and seasonality, consistent with our findings from the visual inspection above.
+```{r}
+s_4904.ets <- ets(train_4904_ts, model = "ZZZ", ic="bic")
+s_4904.ets
+```
+\
+**Model selection**\
+As discussed above, we have chosen to focus on the out-of-sample multi-step ahead forecast accuracy. As such, we compare these accuracies for the optimal ARIMA model and optimal Holt-Winters' model. The Holt-Winters' model performs better than the ARIMA model as it has lower RMSEs as compared to those of the ARIMA model. As such, we select the optimal Holt-Winters' model to do the forecast for store 4904.
+```{r}
+test_4904_ts <- ts(test_4904[,2], start=c(as.numeric(strftime(min(test_4904$date), format="%V")),
+                                          as.numeric(strftime(min(test_4904$date), format="%u"))), frequency=7)
+accuracy(forecast(s_4904.m, h=nrow(test_4904)), test_4904_ts) # ARIMA
+accuracy(forecast(s_4904.ets, h=nrow(test_4904)), test_4904_ts) # Holt-Winters'
+```
+Using the Holt-Winters' model "ANA", we forecast the lettuce quantities for the next 14 days and add them to the results dataframe.\
+```{r}
+# Forecast lettuce quantity for 14 days
+s_4904.ets.ana <- ets(s_4904_ts, model = "ANA")
+s_4904.results <- forecast(s_4904.ets.ana, h=14)
+
+# Add forecast to dataframe of results
+results$"California 2 (ID:4904)" <- as.data.frame(s_4904.results)[,1]
+head(results)
+```
+We plot the forecasted quantities of lettuce using the model below. The forecast appears rather satisfactory as it has seasonality and the values are similar to the time series values except for a few peaks which it underestimates.\
+```{r}
+plot(s_4904.results)
+lines(fitted(s_4904.results), col = "blue", lty = 2)
+```
+\
+The selected model of ETS(A,N,A) is suitable for forecasting the lettuce quantities for store 4904.\
+
+#### 7.2 Store 12631\
+**ARIMA model**\
+For store 12631, there is a slight upward trend but no strong evidence of seasonality in the time series.
+```{r}
+s_12631_ts <- ts(s_12631[,2], start=c(as.numeric(strftime(min(s_12631$date), format="%V")),
+                                      as.numeric(strftime(min(s_12631$date), format="%u"))), frequency=7)
+ggtsdisplay(s_12631_ts)
+```
+\
+Due to the trend in s_12631, it is non-stationary and we take the first-order difference to remove the trend. After the differencing, we plot the time series and see that it now looks stationary.
+```{r}
+# take first order difference
+s_12631.diff1 <- diff(s_12631_ts, differences = 1)
+autoplot(s_12631.diff1)
+```
+\
+We also find that all three stationarity tests are consistent in their results and indicate that the time series with first-order differencing is stationary.
+```{r}
+adf.test(s_12631.diff1) 
+pp.test(s_12631.diff1)
+kpss.test(s_12631.diff1)
+```
+Using $ndiffs()$ and $nsdiffs()$, we can see that the time series for store 12631 has a trend and requires first-order differencing but does not have seasonality. This is consistent with our observations from the plot above.
+```{r}
+# Trend and seasonality
+print(paste(ndiffs(s_12631_ts), nsdiffs(s_12631_ts)))
+```
+Using the $auto.arima()$ function on the time series (without first-order differencing), we find that ARIMA(0,1,1)(1,0,0)[7] is the optimal ARIMA model given its lowest BIC value amongst the other models. d and q each take on a value of 1 here, which indicates the presence of a trend and the need for first-order differencing.
+```{r}
+train_12631_ts <- ts(train_12631[,2], start=c(as.numeric(strftime(min(train_12631$date), format="%V")),
+                                              as.numeric(strftime(min(train_12631$date), format="%u"))), frequency=7)
+auto.arima(train_12631_ts, trace = TRUE, ic = 'bic')
+```
+We create a model based on the optimal ARIMA model to be used for forecasting and also check the residuals. Again, the residuals appear to have zero mean with constant variance and are distributed evenly around zero. There are also no significant ACF lags.
+```{r}
+s_12631.m <- Arima(train_12631_ts, order=c(0,1,1), seasonal=list(order = c(1,0,0), period = 7))
+checkresiduals(s_12631.m)
+```
+\
+**Holt-Winters' model**\
+We plot the time series for store 12631 which shows multiplicative seasonality.
+```{r}
+s_12631_ts[,1] %>% stl(s.window = "period") %>% autoplot
+```
+\
+The optimal Holt-Winters' model suggested by the $ets()$ function is ETS(M,N,M).
+```{r}
+s_12631.ets <- ets(train_12631_ts, model = "ZZZ", ic="bic")
+s_12631.ets
+```
+\
+**Model selection**\
+We compare the out-of-sample multi-step ahead forecast accuracies for the optimal ARIMA and Holt-Winters' models. As with the two stores discussed earlier, Holt-Winters' performs better than the ARIMA model. Therefore, we choose the Holt-Winters' model for forecasting for store 12631. 
+```{r}
+test_12631_ts <- ts(test_12631[,2], start=c(as.numeric(strftime(min(test_12631$date), format="%V")),
+                                            as.numeric(strftime(min(test_12631$date), format="%u"))), frequency=7)
+accuracy(forecast(s_12631.m, h=nrow(test_12631)), test_12631_ts) # ARIMA
+accuracy(forecast(s_12631.ets, h=nrow(test_12631)), test_12631_ts) # Holt-Winters'
+```
+Using the Holt-Winters' model "MNM", we forecast the lettuce quantities for the next 14 days and add them to the results dataframe.\
+```{r}
+# Forecast lettuce quantity for 14 days
+s_12631.ets.ana <- ets(s_12631_ts, model = "MNM")
+s_12631.results <- forecast(s_12631.ets.ana, h=14)
+
+# Add forecast to dataframe of results
+results$"New York 1 (ID:12631)" <- as.data.frame(s_12631.results)[,1]
+head(results)
+```
+```{r}
+plot(s_12631.results)
+lines(fitted(s_12631.results), col = "blue", lty = 2)
+```
+\
+Similar to before, the forecasted values underestimate a number of the peaks, as shown in the plot above. However, the forecast are generally similar in terms of seasonality.\
+
+#### 7.3 Store 20974\
+**ARIMA model**\
+The time series for store 20974 shows no strong evidence of both trend and seasonality. 
+```{r}
+s_20974_ts <- ts(s_20974[,2], start=c(as.numeric(strftime(min(s_20974$date), format="%V")),
+                                      as.numeric(strftime(min(s_20974$date), format="%u"))), frequency=7)
+ggtsdisplay(s_20974_ts)
+```
+\
+All 3 stationarity tests for the time series of store 20974 conclude that it is stationary, in line with our earlier observation.
+```{r}
+adf.test(s_20974_ts) 
+pp.test(s_20974_ts)
+kpss.test(s_20974_ts)
+```
+We select the best ARIMA model based on BIC using the training set and this is ARIMA(1,0,0)(1,0,0)[7] with non-zero mean. This is in line with our observations as the values of d and D are both 0, which indicates that no first-order differencing or seasonal lags are required.
+```{r}
+train_20974_ts <- ts(train_20974[,2], start=c(as.numeric(strftime(min(train_20974$date), format="%V")),
+                                              as.numeric(strftime(min(train_20974$date), format="%u"))), frequency=7)
+auto.arima(train_20974_ts, trace = TRUE, ic = 'bic')
+```
+We create the forecasting model based on the optimal ARIMA model and check the residuals.
+```{r}
+s_20974.m <- Arima(train_20974_ts, order=c(1,0,0), seasonal=list(order = c(1,0,0), period = 7))
+checkresiduals(s_20974.m)
+```
+\
+**Holt-Winters' Model**\
+Similar to the plot of store 4904, we can see that the time series for store 20974 has some additive seasonality and error. There is also no trend.
+```{r}
+s_20974_ts[,1] %>% stl(s.window = "period") %>% autoplot
+```
+\
+For store 20974, we obtain the optimal Holt-Winters' model as ETS(A,N,A) which indicates that it has an additive error and seasonality but no trend.
+```{r}
+s_20974.ets <- ets(train_20974_ts, model = "ZZZ", ic="bic")
+s_20974.ets
+```
+\
+**Model selection**\
+For store 20974, we choose the Holt-Winters' model over the ARIMA model as it performs better for the out-of-sample multi-step accuracy.
+```{r}
+test_20974_ts <- ts(test_20974[,2], start=c(as.numeric(strftime(min(test_20974$date), format="%V")),
+                                            as.numeric(strftime(min(test_20974$date), format="%u"))), frequency=7)
+accuracy(forecast(s_20974.m, h=nrow(test_20974)), test_20974_ts) # ARIMA
+accuracy(forecast(s_20974.ets, h=nrow(test_20974)), test_20974_ts) # Holt-Winters'
+```
+Using the Holt-Winters' model "ANA", we forecast the lettuce quantities for the next 14 days and add them to the results dataframe.
+```{r}
+# Forecast lettuce quantity for 14 days
+s_20974.ets.ana <- ets(s_20974_ts, model = "ANA")
+s_20974.results <- forecast(s_20974.ets.ana, h=14)
+
+# Add forecast to dataframe of results
+results$"New York 2 (ID:20974)" <- as.data.frame(s_20974.results)[,1]
+head(results)
+```
+The plot for the forecasted values for store 20974 appear to perform less well than the previous stores. Although it has a seasonality, the values appear to be slightly offset such that in one of the weeks (~16), the forecasted value is a trough instead of the peak.\
+```{r}
+plot(s_20974.results)
+lines(fitted(s_20974.results), col = "blue", lty = 2)
+```
+\
+Finally, all the forecasted quantities of lettuce in the results dataframe are saved and exported as the file "01005792.csv".
+```{r}
+write.csv(results, "01005792.csv", row.names=FALSE)
+```
+
+### 8. Conclusion
+In this report, we forecasted the quantity of lettuce for 4 separate restaurants using Holt-Winters' model, specifically the "ANA" model for stores 46673, 4904 and 20974 and "MNM" model for store 12631. These models were derived from a comparison of both ARIMA and Holt-Winters' models for each store, taking into account the characteristics of each store's time series, such as whether there were trends or seasonality. Considering the nature of the supply chain for lettuce and comparing various accuracy measures, we focused on using the out-of-sample multi-step ahead accuracy to select the best forecasting model for each store.
