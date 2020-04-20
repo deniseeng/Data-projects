@@ -7,7 +7,7 @@ Data on Airbnb listings in NYC was pre-processed to be used for further analysis
 
 ## 2) Employee resignations in supermarket chain (Tableau)
 Exploratory data analysis was carried out on a dataset comprising termination data from a supermarket chain from 2006 to 2015.
-These data visualisations enabled insights to be drawn, such as high attrition rates amongst certain employee groups and key characteristics of employees who were resigning. Based on these, several recommendations could be made.
+These data visualisations enabled insights to be drawn, such as high attrition rates amongst certain employee groups and key characteristics of employees who resigned. Based on these, several recommendations could be made.
 
 ## 3) Forecasting for fast food chain (R)
 This individual project involves forecasting of a particular ingredient used by 4 stores of a fast food chain. Forecasting demand of products and therefore the ingredients required can enable more efficient supply chains.
